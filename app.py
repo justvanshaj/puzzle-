@@ -9,32 +9,31 @@ from PIL import Image
 from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
 
 
-# --------------------------------------------------
+# ==========================================
 # PAGE CONFIGURATION
-# --------------------------------------------------
+# ==========================================
 
 st.set_page_config(
-    page_title="Jigsaw Live Solver",
+    page_title="Jigsaw Master",
     page_icon="🧩",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("🧩 Jigsaw Live Solver")
-st.caption("Live camera + AI-assisted visual matching for jigsaw puzzles")
+st.title("🧩 Jigsaw Master")
+st.caption("Live camera and computer-vision puzzle assistant")
 
 st.info(
-    "This application helps you find possible locations for individual "
-    "jigsaw pieces. It uses computer vision to compare a piece photograph "
-    "with a reference image. Results are suggestions, not guaranteed solutions."
+    "Upload a completed puzzle image, photograph a loose piece, "
+    "and let the application search for possible visual matches."
 )
 
 
-# --------------------------------------------------
+# ==========================================
 # CAMERA PROCESSOR
-# --------------------------------------------------
+# ==========================================
 
 class CameraProcessor(VideoProcessorBase):
-    """Receive and retain the latest live camera frame."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -56,20 +55,16 @@ class CameraProcessor(VideoProcessorBase):
             return self._latest_frame.copy()
 
 
-# --------------------------------------------------
+# ==========================================
 # IMAGE UTILITIES
-# --------------------------------------------------
+# ==========================================
 
 def pil_to_bgr(image: Image.Image) -> np.ndarray:
-    """Convert a PIL image into an OpenCV BGR image."""
-
     rgb = np.array(image.convert("RGB"))
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
 def bgr_to_rgb(image: np.ndarray) -> np.ndarray:
-    """Convert OpenCV BGR image to RGB."""
-
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
@@ -77,7 +72,6 @@ def resize_to_width(
     image: np.ndarray,
     max_width: int = 1400,
 ) -> np.ndarray:
-    """Resize large images while preserving their aspect ratio."""
 
     height, width = image.shape[:2]
 
@@ -93,24 +87,14 @@ def resize_to_width(
     )
 
 
-# --------------------------------------------------
-# JIGSAW PIECE MATCHING
-# --------------------------------------------------
+# ==========================================
+# PUZZLE PIECE MATCHING
+# ==========================================
 
 def orb_match_locations(
     piece_bgr: np.ndarray,
     reference_bgr: np.ndarray,
 ):
-    """
-    Compare a puzzle-piece photograph with the reference image.
-
-    Uses ORB keypoints, descriptor matching, and RANSAC homography.
-
-    Returns:
-        annotated_reference: Reference image with possible matches.
-        status: Human-readable explanation.
-        match_count: Number of accepted feature matches.
-    """
 
     piece = resize_to_width(piece_bgr, 700)
     reference = resize_to_width(reference_bgr, 1600)
@@ -133,30 +117,28 @@ def orb_match_locations(
         nlevels=8,
     )
 
-    keypoints_piece, descriptors_piece = (
-        orb.detectAndCompute(piece_gray, None)
+    kp_piece, des_piece = orb.detectAndCompute(
+        piece_gray,
+        None,
     )
 
-    keypoints_reference, descriptors_reference = (
-        orb.detectAndCompute(reference_gray, None)
+    kp_reference, des_reference = orb.detectAndCompute(
+        reference_gray,
+        None,
     )
-
-    # Check whether both images contain enough visual features.
 
     if (
-        descriptors_piece is None
-        or descriptors_reference is None
-        or len(keypoints_piece) < 4
-        or len(keypoints_reference) < 4
+        des_piece is None
+        or des_reference is None
+        or len(kp_piece) < 4
+        or len(kp_reference) < 4
     ):
         return (
             annotated,
-            "Not enough distinctive visual features were found. "
-            "Try a closer, sharper photograph with less glare.",
+            "Not enough distinctive visual features. "
+            "Try a clearer, closer photograph.",
             0,
         )
-
-    # Match visual descriptors.
 
     matcher = cv2.BFMatcher(
         cv2.NORM_HAMMING,
@@ -164,49 +146,40 @@ def orb_match_locations(
     )
 
     pairs = matcher.knnMatch(
-        descriptors_piece,
-        descriptors_reference,
+        des_piece,
+        des_reference,
         k=2,
     )
 
     good_matches = []
 
     for pair in pairs:
+
         if len(pair) == 2:
+
             first, second = pair
 
             if first.distance < 0.72 * second.distance:
                 good_matches.append(first)
 
-    # Too few matches usually means that the piece lacks
-    # enough distinctive visual details.
-
     if len(good_matches) < 4:
+
         return (
             annotated,
-            f"Only {len(good_matches)} useful feature matches "
-            "were found. Try a piece containing lettering, a "
-            "distinctive colour boundary, or a unique pattern.",
+            f"Only {len(good_matches)} useful feature matches. "
+            "Try a piece with a distinctive pattern or lettering.",
             len(good_matches),
         )
 
-    # Prepare corresponding feature coordinates.
+    source_points = np.float32([
+        kp_piece[m.queryIdx].pt
+        for m in good_matches
+    ]).reshape(-1, 1, 2)
 
-    source_points = np.float32(
-        [
-            keypoints_piece[match.queryIdx].pt
-            for match in good_matches
-        ]
-    ).reshape(-1, 1, 2)
-
-    destination_points = np.float32(
-        [
-            keypoints_reference[match.trainIdx].pt
-            for match in good_matches
-        ]
-    ).reshape(-1, 1, 2)
-
-    # Estimate the geometric relationship between the images.
+    destination_points = np.float32([
+        kp_reference[m.trainIdx].pt
+        for m in good_matches
+    ]).reshape(-1, 1, 2)
 
     homography, mask = cv2.findHomography(
         source_points,
@@ -215,41 +188,32 @@ def orb_match_locations(
         5.0,
     )
 
-    inliers = (
-        int(mask.sum())
-        if mask is not None
-        else 0
-    )
-
-    # Draw a possible piece location if a transformation
-    # can be estimated.
+    inliers = int(mask.sum()) if mask is not None else 0
 
     if homography is not None and inliers >= 4:
 
-        piece_height, piece_width = piece_gray.shape
+        height, width = piece_gray.shape
 
-        corners = np.float32(
-            [
-                [0, 0],
-                [piece_width, 0],
-                [piece_width, piece_height],
-                [0, piece_height],
-            ]
-        ).reshape(-1, 1, 2)
+        corners = np.float32([
+            [0, 0],
+            [width, 0],
+            [width, height],
+            [0, height],
+        ]).reshape(-1, 1, 2)
 
-        projected_corners = cv2.perspectiveTransform(
+        projected = cv2.perspectiveTransform(
             corners,
             homography,
         )
 
-        polygon = np.int32(projected_corners)
+        polygon = np.int32(projected)
 
-        reference_height, reference_width = reference.shape[:2]
+        ref_height, ref_width = reference.shape[:2]
 
         if (
             np.isfinite(polygon).all()
             and np.max(np.abs(polygon))
-            < max(reference_width, reference_height) * 5
+            < max(ref_width, ref_height) * 5
         ):
 
             cv2.polylines(
@@ -274,28 +238,20 @@ def orb_match_locations(
                 -1,
             )
 
-            status = (
-                "Possible matching location highlighted in red. "
-                f"Feature matches: {len(good_matches)}. "
-                f"Geometric inliers: {inliers}. "
-                "Verify the result manually."
+            return (
+                annotated,
+                f"Possible location marked in red. "
+                f"Matches: {len(good_matches)}; "
+                f"geometric inliers: {inliers}.",
+                len(good_matches),
             )
 
-            return annotated, status, len(good_matches)
-
-    # If the piece outline cannot be estimated, mark the
-    # strongest individual feature matches instead.
-
-    strongest_matches = sorted(
+    for match in sorted(
         good_matches,
-        key=lambda match: match.distance,
-    )[:20]
+        key=lambda m: m.distance,
+    )[:20]:
 
-    for match in strongest_matches:
-
-        x, y = keypoints_reference[
-            match.trainIdx
-        ].pt
+        x, y = kp_reference[match.trainIdx].pt
 
         cv2.circle(
             annotated,
@@ -306,40 +262,38 @@ def orb_match_locations(
             cv2.LINE_AA,
         )
 
-    status = (
-        f"Found {len(good_matches)} feature matches, but "
-        "could not calculate a reliable piece outline. "
-        "Red circles indicate candidate feature locations."
+    return (
+        annotated,
+        "Found visual matches, but could not estimate a "
+        "reliable piece outline. Red circles are candidate clues.",
+        len(good_matches),
     )
 
-    return annotated, status, len(good_matches)
 
-
-# --------------------------------------------------
-# SIDEBAR: REFERENCE IMAGE
-# --------------------------------------------------
+# ==========================================
+# SIDEBAR
+# ==========================================
 
 with st.sidebar:
 
-    st.header("🖼️ Reference Image")
+    st.header("🖼️ Puzzle Reference")
 
     reference_upload = st.file_uploader(
-        "Upload the completed puzzle picture",
+        "Upload completed puzzle image",
         type=["png", "jpg", "jpeg", "webp"],
         key="reference",
     )
 
     st.divider()
 
-    st.header("📸 Camera Tips")
-
     st.markdown(
         """
+        ### Camera tips
+
         - Use bright, indirect lighting.
-        - Keep the camera parallel to the puzzle.
-        - Avoid reflections and shadows.
-        - Photograph one loose piece at a time.
-        - Keep the entire printed area of the piece visible.
+        - Avoid glare and shadows.
+        - Photograph one piece at a time.
+        - Keep the camera parallel to the table.
         """
     )
 
@@ -349,46 +303,42 @@ reference_bgr = None
 if reference_upload is not None:
 
     try:
-        reference_pil = Image.open(
+        reference_image = Image.open(
             reference_upload
         ).convert("RGB")
 
-        reference_bgr = pil_to_bgr(reference_pil)
+        reference_bgr = pil_to_bgr(reference_image)
 
     except Exception as exc:
-        st.error(
-            f"Could not read the reference image: {exc}"
-        )
+        st.error(f"Could not read reference image: {exc}")
 
 
-# --------------------------------------------------
-# MAIN TABS
-# --------------------------------------------------
+# ==========================================
+# APPLICATION TABS
+# ==========================================
 
-camera_tab, matching_tab, help_tab = st.tabs(
-    [
-        "📹 Live Camera",
-        "🔎 Match a Piece",
-        "ℹ️ Help",
-    ]
-)
+camera_tab, match_tab, help_tab = st.tabs([
+    "📹 Live Camera",
+    "🔎 Match a Piece",
+    "ℹ️ Help",
+])
 
 
-# --------------------------------------------------
-# TAB 1: LIVE CAMERA
-# --------------------------------------------------
+# ==========================================
+# LIVE CAMERA
+# ==========================================
 
 with camera_tab:
 
-    st.subheader("Live Camera Preview")
+    st.subheader("Live Camera")
 
     st.write(
         "Press START and allow camera permission. "
-        "For mobile devices, camera access generally requires HTTPS."
+        "Mobile camera access generally requires HTTPS."
     )
 
     camera_context = webrtc_streamer(
-        key="jigsaw-live-camera",
+        key="jigsaw-master-camera",
         mode=WebRtcMode.SENDRECV,
         video_processor_factory=CameraProcessor,
         media_stream_constraints={
@@ -398,14 +348,14 @@ with camera_tab:
         async_processing=True,
     )
 
-    left_column, right_column = st.columns(2)
+    left, right = st.columns(2)
 
-    with left_column:
+    with left:
 
-        st.markdown("### 📷 Capture a Photograph")
+        st.subheader("📷 Capture a Photograph")
 
         captured_photo = st.camera_input(
-            "Take a photo of a puzzle piece",
+            "Photograph a puzzle piece",
             key="still_camera",
         )
 
@@ -416,22 +366,17 @@ with camera_tab:
             ] = captured_photo.getvalue()
 
             st.success(
-                "Photograph captured! Open the Match a Piece tab."
+                "Photo captured. Open Match a Piece."
             )
 
-    with right_column:
+    with right:
 
-        st.markdown("### Camera Status")
+        st.subheader("Camera Status")
 
         if camera_context.state.playing:
-
-            st.success("Live camera is running.")
-
+            st.success("Camera is running.")
         else:
-
-            st.warning(
-                "Camera is not running. Press START above."
-            )
+            st.warning("Press START to activate the camera.")
 
         if camera_context.video_processor:
 
@@ -447,46 +392,32 @@ with camera_tab:
                     use_container_width=True,
                 )
 
-            else:
 
-                st.caption(
-                    "Waiting for the first camera frame..."
-                )
+# ==========================================
+# MATCH A PIECE
+# ==========================================
 
-
-# --------------------------------------------------
-# TAB 2: MATCH A PUZZLE PIECE
-# --------------------------------------------------
-
-with matching_tab:
+with match_tab:
 
     st.subheader("Find a Possible Piece Location")
 
     if reference_bgr is None:
 
         st.warning(
-            "First upload your puzzle reference image "
-            "using the sidebar."
+            "Upload your completed puzzle reference "
+            "image in the sidebar."
         )
 
     else:
 
         st.image(
             bgr_to_rgb(reference_bgr),
-            caption="Puzzle reference image",
+            caption="Reference image",
             use_container_width=True,
         )
 
-    st.markdown(
-        """
-        Upload a close-up photo of one loose piece.
-        The application will compare its visual features
-        with the reference picture.
-        """
-    )
-
-    piece_source = st.radio(
-        "Choose the piece photograph source",
+    source = st.radio(
+        "Piece photograph source",
         [
             "Upload a photo",
             "Use captured camera photo",
@@ -496,10 +427,10 @@ with matching_tab:
 
     piece_bgr = None
 
-    if piece_source == "Upload a photo":
+    if source == "Upload a photo":
 
         piece_upload = st.file_uploader(
-            "Upload a close-up photograph of one piece",
+            "Upload close-up of one piece",
             type=["png", "jpg", "jpeg", "webp"],
             key="piece_upload",
         )
@@ -508,154 +439,123 @@ with matching_tab:
 
             try:
 
-                piece_pil = Image.open(
+                piece_image = Image.open(
                     piece_upload
                 ).convert("RGB")
 
-                piece_bgr = pil_to_bgr(piece_pil)
+                piece_bgr = pil_to_bgr(piece_image)
 
             except Exception as exc:
 
-                st.error(
-                    f"Could not read the piece photograph: {exc}"
-                )
+                st.error(f"Could not read piece image: {exc}")
 
     else:
 
-        captured_bytes = st.session_state.get(
+        captured = st.session_state.get(
             "captured_still_bytes"
         )
 
-        if captured_bytes:
+        if captured:
 
-            try:
+            piece_image = Image.open(
+                io.BytesIO(captured)
+            ).convert("RGB")
 
-                captured_pil = Image.open(
-                    io.BytesIO(captured_bytes)
-                ).convert("RGB")
-
-                piece_bgr = pil_to_bgr(captured_pil)
-
-            except Exception as exc:
-
-                st.error(
-                    f"Could not read the captured photograph: {exc}"
-                )
+            piece_bgr = pil_to_bgr(piece_image)
 
         else:
 
             st.info(
-                "Open Live Camera and capture a photograph first."
+                "Capture a photograph in the Live Camera tab first."
             )
 
     if piece_bgr is not None:
 
         st.image(
             bgr_to_rgb(piece_bgr),
-            caption="Piece photograph to analyse",
+            caption="Selected puzzle piece",
             use_container_width=True,
         )
 
-    analyse_button = st.button(
-        "🔍 Analyse Piece Against Reference",
+    if st.button(
+        "🔍 Analyse Piece",
         type="primary",
         disabled=(
             reference_bgr is None
             or piece_bgr is None
         ),
-    )
+    ):
 
-    if analyse_button:
+        with st.spinner("Analysing visual features..."):
 
-        with st.spinner(
-            "Comparing visual features..."
-        ):
-
-            annotated, status, match_count = (
-                orb_match_locations(
-                    piece_bgr,
-                    reference_bgr,
-                )
+            annotated, message, count = orb_match_locations(
+                piece_bgr,
+                reference_bgr,
             )
 
         st.subheader("Matching Result")
 
-        st.write(status)
+        st.write(message)
 
         st.image(
             bgr_to_rgb(annotated),
-            caption="Reference image with candidate clues",
+            caption="Reference with candidate clues",
             use_container_width=True,
         )
 
-        if match_count < 4:
+        if count < 4:
 
             st.warning(
-                "A reliable match was not found. Try a "
-                "sharper photograph or a piece with distinctive artwork."
+                "No reliable match found. Try a sharper "
+                "photo or a piece with a distinctive pattern."
             )
 
         else:
 
             st.info(
-                "The highlighted location is only a candidate. "
-                "Check the artwork, orientation, and physical piece shape."
+                "The highlighted location is a candidate, "
+                "not a guaranteed placement. Verify the physical fit."
             )
 
 
-# --------------------------------------------------
-# TAB 3: HELP AND LIMITATIONS
-# --------------------------------------------------
+# ==========================================
+# HELP
+# ==========================================
 
 with help_tab:
 
-    st.subheader("How to Use the App")
+    st.subheader("How to Use Jigsaw Master")
 
     st.markdown(
         """
-        **Step 1:** Upload a clear reference image.
-
-        **Step 2:** Start the live camera and allow permission.
-
-        **Step 3:** Photograph one loose puzzle piece or upload its photo.
-
-        **Step 4:** Open Match a Piece.
-
-        **Step 5:** Press Analyse Piece Against Reference.
-
-        **Step 6:** Check the highlighted candidate location manually.
+        1. Upload a reference image.
+        2. Start the live camera.
+        3. Capture or upload one loose puzzle piece.
+        4. Open Match a Piece.
+        5. Analyse the piece.
+        6. Verify the suggested location manually.
         """
     )
 
     st.warning(
-        """
-        Limitations:
-
-        - The current matching algorithm uses ORB feature matching.
-        - Plain colours and glossy surfaces can be difficult to match.
-        - Different camera angles and piece rotations may reduce accuracy.
-        - The app does not automatically solve all 1,000 pieces.
-        - A highlighted location is not a guaranteed placement.
-        """
+        "This is a prototype. Visual matching can fail on plain colours, "
+        "reflections, blurry photos, and rotated pieces. It does not "
+        "automatically solve the entire puzzle."
     )
 
     st.markdown(
-        """
-        **Privacy:** If the app is deployed on a cloud service,
-        uploaded and captured images are sent to that service for
-        processing. The live camera component streams video frames
-        while it is active.
-        """
+        "**Privacy:** On a cloud-hosted app, uploaded images are sent "
+        "to the hosting service for processing. Camera frames stream "
+        "while the camera is active."
     )
 
 
-# --------------------------------------------------
+# ==========================================
 # FOOTER
-# --------------------------------------------------
+# ==========================================
 
 st.divider()
 
 st.caption(
-    "Jigsaw Live Solver | Streamlit + OpenCV | "
-    "Computer-vision puzzle assistance prototype"
+    "Jigsaw Master | Streamlit + OpenCV"
 )
